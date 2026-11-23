@@ -939,6 +939,9 @@
       let selectedCallingCode = '1'
       let availableCountries = []
       let selectedCountry = null
+      let countryLoadPromise = null
+      const COUNTRY_CACHE_KEY = 'smscode_us_country_cache_v1'
+      const COUNTRY_CACHE_MAX_AGE = 30 * 24 * 60 * 60 * 1000
       const orderProviders = new Map()
       let applyingRemoteSettings = false
       let currentSharedRevision = 0
@@ -1075,13 +1078,40 @@
         try {
           elements.countryField.style.display = ''
           if (!availableCountries.length) {
-            availableCountries = asArray(await client.getCountries())
-              .filter(country => {
-                const iso = textOf(country, ['iso2', 'iso', 'code', 'country_code']).toUpperCase()
-                const name = textOf(country, ['name', 'country_name', 'title']).toLowerCase()
-                return Number(country.id ?? country.country_id) > 0 &&
-                  (['US', 'USA'].includes(iso) || name.includes('united states') || name === 'usa' || name === 'united states of america')
-              })
+            // Ưu tiên cache trình duyệt: tải danh sách Mỹ đúng một lần, dùng lại 30 ngày.
+            if (!countryLoadPromise) {
+              countryLoadPromise = (async () => {
+                try {
+                  const cached = JSON.parse(localStorage.getItem(COUNTRY_CACHE_KEY) || 'null')
+                  if (
+                    cached &&
+                    Array.isArray(cached.countries) &&
+                    cached.countries.length &&
+                    Date.now() - Number(cached.savedAt || 0) < COUNTRY_CACHE_MAX_AGE
+                  ) {
+                    return cached.countries
+                  }
+                } catch (_) {}
+
+                const countries = asArray(await client.getCountries()).filter(country => {
+                  const iso = textOf(country, ['iso2', 'iso', 'code', 'country_code']).toUpperCase()
+                  const name = textOf(country, ['name', 'country_name', 'title']).toLowerCase()
+                  return Number(country.id ?? country.country_id) > 0 &&
+                    (['US', 'USA'].includes(iso) || name.includes('united states') || name === 'usa' || name === 'united states of america')
+                })
+
+                if (countries.length) {
+                  try {
+                    localStorage.setItem(COUNTRY_CACHE_KEY, JSON.stringify({
+                      savedAt: Date.now(),
+                      countries
+                    }))
+                  } catch (_) {}
+                }
+                return countries
+              })()
+            }
+            availableCountries = await countryLoadPromise
           }
 
           if (!availableCountries.length) {
