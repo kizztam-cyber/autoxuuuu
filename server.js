@@ -6,9 +6,9 @@ const express = require('express')
 const { Server } = require('socket.io')
 const os = require('node:os')
 
-const SMSCODE_TOKEN = 'dfdf247509885b443cceecf6214e8e51e0c46eeb9fdb91a6d529973f206f787c'
-const AUTOSMS_API_KEY = 'c4926cbc5d'
-const AUTOSMS_BASE_URL = 'https://autosms.site'
+const SMSCODE_TOKEN = 'f3627025b2ea12b051ba385bf2e135687bc4ce90459e2ef386b78ebb5bbe9cbd'
+const GRIZZLY_API_KEY = 'dd00afe86fb143948187acdbff3085ba'
+const GRIZZLY_BASE_URL = 'https://api.grizzlysms.com/stubs/handler_api.php'
 const DEFAULT_UPSTREAM = 'https://api.smscode.gg/v2'
 const MAX_BODY_BYTES = 65536
 
@@ -271,184 +271,125 @@ async function proxyToSmscode(request, response, route, config) {
   sendJson(response, upstream.status, payload)
 }
 
-function normalizeAutoSmsOrder(data = {}) {
-  const code = data.code == null ? '' : String(data.code).trim()
-  const rawStatus = String(data.status || '').toLowerCase()
-
-  let status = 'ACTIVE'
-
-  if (code) status = 'OTP_RECEIVED'
-  else if (['cancelled', 'canceled'].includes(rawStatus)) status = 'CANCELED'
-  else if (['expired', 'timeout'].includes(rawStatus)) status = 'EXPIRED'
-  else if (['completed', 'done'].includes(rawStatus)) status = 'COMPLETED'
-
-  return {
-    id: String(data.id || data.order_id || ''),
-    phone_number: String(data.phone || data.phone_number || ''),
-    otp_code: code || null,
-    status,
-    price: data.price ?? null,
-    message: data.message || '',
-    expired_at: data.expired_at || null,
-    remaining_seconds: data.remaining_seconds ?? null,
+function grizzlyErrorMessage(value) {
+  const raw = String(value || '').trim()
+  const messages = {
+    BAD_KEY: 'GrizzlySMS API key không hợp lệ. Kiểm tra GRIZZLY_API_KEY trên Render.',
+    NO_BALANCE: 'Số dư GrizzlySMS không đủ.',
+    NO_NUMBERS: 'Không có số USA virtual ở mức giá đã chọn. Thử mức giá khác.',
+    SERVICE_UNAVAILABLE_REGION: 'GrizzlySMS đang giới hạn truy cập từ khu vực máy chủ này.',
+    BAD_SERVICE: 'Mã dịch vụ TikTok không hợp lệ hoặc không được hỗ trợ.',
+    BAD_ACTION: 'GrizzlySMS không hỗ trợ thao tác API này.',
   }
+  return messages[raw] || raw || 'GrizzlySMS trả về lỗi không xác định.'
 }
 
-async function callAutoSms(pathname, config) {
-  const url = new URL(pathname, AUTOSMS_BASE_URL)
-  url.searchParams.set('key', config.autosmsApiKey)
-
+async function grizzlyRequest(params, config) {
+  if (!config.grizzlyApiKey) throw new HttpError(503, 'GRIZZLY_NOT_CONFIGURED', 'Chưa cấu hình GRIZZLY_API_KEY trên Render.')
+  const url = new URL(GRIZZLY_BASE_URL)
+  url.searchParams.set('api_key', config.grizzlyApiKey)
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null && value !== '') url.searchParams.set(key, String(value))
+  }
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), 25000)
-  let upstream
-
+  let response
   try {
-    upstream = await config.fetchImpl(url, {
-      method: 'GET',
-      headers: { accept: 'application/json' },
-      signal: controller.signal,
-    })
+    response = await config.fetchImpl(url, { method: 'GET', headers: { accept: 'application/json,text/plain' }, signal: controller.signal })
   } catch {
-    throw new HttpError(502, 'AUTOSMS_CONNECTION_ERROR', 'Không thể kết nối đến AutoSMS.')
-  } finally {
-    clearTimeout(timeout)
+    throw new HttpError(502, 'GRIZZLY_CONNECTION_ERROR', 'Không thể kết nối GrizzlySMS.')
+  } finally { clearTimeout(timeout) }
+  const text = await response.text()
+  let data
+  try { data = JSON.parse(text) } catch { data = text.trim() }
+  if (!response.ok) throw new HttpError(502, 'GRIZZLY_HTTP_ERROR', `GrizzlySMS HTTP ${response.status}: ${String(data).slice(0,180)}`)
+  if (typeof data === 'string' && /^(BAD_KEY|NO_BALANCE|NO_NUMBERS|SERVICE_UNAVAILABLE_REGION|BAD_SERVICE|BAD_ACTION|ERROR)/.test(data)) {
+    throw new HttpError(502, 'GRIZZLY_API_ERROR', grizzlyErrorMessage(data))
   }
-
-  let payload
-
-  try {
-    payload = await upstream.json()
-  } catch {
-    throw new HttpError(502, 'AUTOSMS_INVALID_RESPONSE', 'AutoSMS trả về JSON không hợp lệ.')
+  if (data && typeof data === 'object' && (data.status === 'error' || data.status === 'ERROR')) {
+    throw new HttpError(502, 'GRIZZLY_API_ERROR', grizzlyErrorMessage(data.error || data.message))
   }
-
-  if (!upstream.ok || payload.success !== true) {
-    throw new HttpError(
-      502,
-      'AUTOSMS_ERROR',
-      payload.message || `AutoSMS báo lỗi HTTP ${upstream.status}.`
-    )
-  }
-
-  return payload.data
+  return data
 }
 
-async function handleAutoSms(request, response, url, config) {
+async function findGrizzlyTikTokService(config) {
+  const payload = await grizzlyRequest({ action: 'getServicesList' }, config)
+  const services = Array.isArray(payload) ? payload : (payload?.services || payload?.data || [])
+  const found = services.find(item => /tiktok/i.test(String(item?.name || item?.title || '')))
+  if (!found?.code) throw new HttpError(502, 'GRIZZLY_SERVICE_NOT_FOUND', 'Không tìm thấy service TikTok trong danh sách GrizzlySMS.')
+  return String(found.code)
+}
+
+function normalizeGrizzlyOrder(data = {}) {
+  const smsList = Array.isArray(data.sms) ? data.sms : (data.sms && typeof data.sms === 'object' ? [data.sms] : [])
+  const latestSms = smsList.find(item => item?.code || item?.text) || smsList[0] || {}
+  const code = String(latestSms.code || data.smsCode || data.code || '').trim()
+  const raw = String(data.status || data.activationStatus || '').toUpperCase()
+  let status = code ? 'OTP_RECEIVED' : 'ACTIVE'
+  if (['CANCELED', 'CANCELLED', 'STATUS_CANCEL'].includes(raw)) status = 'CANCELED'
+  else if (['EXPIRED', 'TIMEOUT'].includes(raw)) status = 'EXPIRED'
+  else if (['COMPLETED', 'DONE', 'STATUS_OK'].includes(raw)) status = code ? 'OTP_RECEIVED' : 'COMPLETED'
+  return {
+    id: String(data.activationId || data.id || ''),
+    phone_number: String(data.phoneNumber || data.phone_number || data.phone || ''),
+    otp_code: code || null,
+    status,
+    price: data.activationCost ?? data.price ?? null,
+    message: latestSms.text || '',
+    expired_at: data.activationEnd || null,
+    remaining_seconds: null,
+  }
+}
+
+async function handleGrizzly(request, response, url, config) {
   const pathname = url.pathname
-
-  if (pathname === '/api/autosms/balance' && request.method === 'GET') {
+  if (pathname === '/api/grizzly/balance' && request.method === 'GET') {
     rejectUnknownQuery(url.searchParams, new Set())
-    const data = await callAutoSms('/api/balance', config)
-    return sendJson(response, 200, { success: true, data })
+    const data = await grizzlyRequest({ action: 'getBalance' }, config)
+    const value = typeof data === 'string' ? data.replace(/^ACCESS_BALANCE:/, '') : (data?.balance ?? data?.amount ?? data)
+    return sendJson(response, 200, { success: true, data: { balance: value } })
   }
-
-  if (pathname === '/api/autosms/catalog') {
-    if (request.method !== 'GET') {
-      throw new HttpError(405, 'METHOD_NOT_ALLOWED', 'Phương thức không được hỗ trợ.')
-    }
-
-    return sendJson(response, 200, {
-      success: true,
-      data: [{
-        id: 1,
-        name: 'TikTok Mỹ · AutoSMS',
-        country: 'US',
-        service: 'TikTok',
-        price: null,
-        available: null,
-      }],
-    })
+  if (pathname === '/api/grizzly/catalog' && request.method === 'GET') {
+    rejectUnknownQuery(url.searchParams, new Set())
+    const service = await findGrizzlyTikTokService(config)
+    return sendJson(response, 200, { success: true, data: { service, country: 12, countryName: 'USA (virtual)', prices: [0.015, 0.025] } })
   }
-
-  if (pathname === '/api/autosms/orders/create' && request.method === 'POST') {
+  if (pathname === '/api/grizzly/orders/create' && request.method === 'POST') {
     rejectUnknownQuery(url.searchParams, new Set())
     const body = await readJsonBody(request)
-
-    if (
-      !body ||
-      typeof body !== 'object' ||
-      Array.isArray(body) ||
-      !Number.isSafeInteger(body.quantity) ||
-      body.quantity < 1 ||
-      body.quantity > 20
-    ) {
-      throw new HttpError(400, 'VALIDATION_ERROR', 'quantity phải là số nguyên từ 1 đến 20.')
+    if (!body || typeof body !== 'object' || Array.isArray(body) || ![0.015, 0.025].includes(Number(body.maxPrice))) {
+      throw new HttpError(400, 'VALIDATION_ERROR', 'maxPrice chỉ được là 0.015 hoặc 0.025.')
     }
-
-    const orders = []
-    let failedCount = 0
-
-    for (let i = 0; i < body.quantity; i++) {
-      try {
-        const data = await callAutoSms('/api/buy-number/us/tiktok', config)
-
-        if (!data || !(data.order_id || data.id) || !data.phone) {
-          throw new Error('Thiếu order_id hoặc phone trong phản hồi AutoSMS.')
-        }
-
-        orders.push({
-          id: String(data.order_id || data.id),
-          phone_number: String(data.phone),
-          otp_code: null,
-          status: 'ACTIVE',
-          price: data.price ?? null,
-          expired_at: data.expired_at || null,
-          country_calling_code: '1',
-        })
-      } catch (error) {
-        failedCount++
-        if (body.quantity === 1) throw error
-      }
+    const service = await findGrizzlyTikTokService(config)
+    const data = await grizzlyRequest({ action: 'getNumberV2', service, country: 12, maxPrice: Number(body.maxPrice) }, config)
+    if (!data || typeof data !== 'object' || !(data.activationId || data.id) || !(data.phoneNumber || data.phone_number)) {
+      throw new HttpError(502, 'GRIZZLY_INVALID_ORDER', 'GrizzlySMS không trả về activationId hoặc phoneNumber hợp lệ.')
     }
-
-    return sendJson(response, 200, {
-      success: true,
-      data: { orders, failed_count: failedCount },
-    })
+    const order = normalizeGrizzlyOrder(data)
+    order.country_calling_code = '1'
+    return sendJson(response, 200, { success: true, data: { orders: [order], failed_count: 0 } })
   }
-
-  const orderMatch = pathname.match(
-    /^\/api\/autosms\/orders\/([A-Za-z0-9_-]{1,100})$/
-  )
-
-  if (orderMatch && request.method === 'GET') {
+  const match = pathname.match(/^\/api\/grizzly\/orders\/(\d+)$/)
+  if (match && request.method === 'GET') {
     rejectUnknownQuery(url.searchParams, new Set())
-    const data = await callAutoSms(
-      `/api/orders/${encodeURIComponent(orderMatch[1])}`,
-      config
-    )
-    return sendJson(response, 200, {
-      success: true,
-      data: normalizeAutoSmsOrder(data || {}),
-    })
+    const data = await grizzlyRequest({ action: 'getStatusV2', id: match[1] }, config)
+    const order = normalizeGrizzlyOrder({ ...(data && typeof data === 'object' ? data : {}), activationId: match[1] })
+    return sendJson(response, 200, { success: true, data: order })
   }
-
-  const cancelMatch = pathname.match(
-    /^\/api\/autosms\/cancel\/([A-Za-z0-9_-]{1,100})$/
-  )
-
-  if (cancelMatch && request.method === 'POST') {
-    rejectUnknownQuery(url.searchParams, new Set())
-    const data = await callAutoSms(
-      `/api/cancel/${encodeURIComponent(cancelMatch[1])}`,
-      config
-    )
-    return sendJson(response, 200, { success: true, data: data || {} })
-  }
-
   return null
 }
+
 function createApp({
   upstreamBaseUrl = DEFAULT_UPSTREAM,
   token = SMSCODE_TOKEN,
-  autosmsApiKey = AUTOSMS_API_KEY,
+  grizzlyApiKey = GRIZZLY_API_KEY,
   fetchImpl = fetch,
   rootDir = __dirname,
 } = {}) {
   const config = {
     upstreamBaseUrl,
     token,
-    autosmsApiKey,
+    grizzlyApiKey,
     fetchImpl,
     rootDir,
   }
@@ -457,16 +398,10 @@ function createApp({
     try {
       const url = new URL(request.url, 'http://127.0.0.1')
 
-      if (url.pathname.startsWith('/api/autosms/')) {
-        const handled = await handleAutoSms(request, response, url, config)
-
+      if (url.pathname.startsWith('/api/grizzly/')) {
+        const handled = await handleGrizzly(request, response, url, config)
         if (handled !== null) return handled
-
-        return sendJson(
-          response,
-          404,
-          errorPayload('NOT_FOUND', 'AutoSMS API route không tồn tại.')
-        )
+        return sendJson(response, 404, errorPayload('NOT_FOUND', 'GrizzlySMS API route không tồn tại.'))
       }
 
       if (url.pathname.startsWith('/api/')) {
@@ -595,7 +530,7 @@ function startServer({
         return null
       }
 
-      const provider = ['smscode', 'autosms'].includes(input.provider)
+      const provider = ['smscode', 'grizzly'].includes(input.provider)
         ? input.provider
         : null
 
