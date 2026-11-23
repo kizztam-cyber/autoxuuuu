@@ -6,7 +6,7 @@ const express = require('express')
 const { Server } = require('socket.io')
 const os = require('node:os')
 
-const SMSCODE_TOKEN = 'e09bd4319395b55c03704cc677430568e8b60dad3cff7264f669c1d914e19c26'
+const SMSCODE_TOKEN = '152b19a7ca3aced18af731a757607513483fea01ee52d92f51ca09d14344eba8'
 const DEFAULT_UPSTREAM = 'https://api.smscode.gg/v2'
 const MAX_BODY_BYTES = 65536
 
