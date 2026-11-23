@@ -1,17 +1,16 @@
 const http = require('node:http')
 const fs = require('node:fs/promises')
 const path = require('node:path')
+const { spawn } = require('node:child_process')
 const express = require('express')
 const { Server } = require('socket.io')
 const os = require('node:os')
 
-const SMSCODE_TOKEN = '152b19a7ca3aced18af731a757607513483fea01ee52d92f51ca09d14344eba8' || ''
+const SMSCODE_TOKEN = 'dfdf247509885b443cceecf6214e8e51e0c46eeb9fdb91a6d529973f206f787c'
+const AUTOSMS_API_KEY = 'c4926cbc5d'
+const AUTOSMS_BASE_URL = 'https://autosms.site'
 const DEFAULT_UPSTREAM = 'https://api.smscode.gg/v2'
 const MAX_BODY_BYTES = 65536
-
-// Cache danh sách Mỹ trong 30 ngày
-let usCountryCache = null
-let usCountryCacheExpiresAt = 0
 
 const STATIC_FILES = new Map([
   ['/', ['index.html', 'text/html; charset=utf-8']],
@@ -49,13 +48,10 @@ function validateSingleInteger(searchParams, name, { min = 1, max = Number.MAX_S
   if (values.length !== 1 || !/^\d+$/.test(values[0])) {
     throw new HttpError(400, 'VALIDATION_ERROR', `${name} phải là số nguyên hợp lệ.`)
   }
-
   const value = Number(values[0])
-
   if (!Number.isSafeInteger(value) || value < min || value > max) {
     throw new HttpError(400, 'VALIDATION_ERROR', `${name} nằm ngoài phạm vi cho phép.`)
   }
-
   return value
 }
 
@@ -69,11 +65,9 @@ function rejectUnknownQuery(searchParams, allowed) {
 
 function buildQuery(values) {
   const query = new URLSearchParams()
-
   for (const [key, value] of Object.entries(values)) {
     query.set(key, String(value))
   }
-
   return query.toString()
 }
 
@@ -82,24 +76,16 @@ function matchApiRoute(method, url) {
     if (method !== 'GET') {
       throw new HttpError(405, 'METHOD_NOT_ALLOWED', 'Phương thức không được hỗ trợ.')
     }
-
     rejectUnknownQuery(url.searchParams, new Set())
-
-    return {
-      upstreamPath: '/catalog/countries',
-      filterUsCountries: true,
-    }
+    return { upstreamPath: '/catalog/countries' }
   }
 
   if (url.pathname === '/api/catalog/services') {
     if (method !== 'GET') {
       throw new HttpError(405, 'METHOD_NOT_ALLOWED', 'Phương thức không được hỗ trợ.')
     }
-
     rejectUnknownQuery(url.searchParams, new Set(['country_id']))
-
     const countryId = validateSingleInteger(url.searchParams, 'country_id')
-
     return {
       upstreamPath: `/catalog/services?${buildQuery({ country_id: countryId })}`,
     }
@@ -110,14 +96,7 @@ function matchApiRoute(method, url) {
       throw new HttpError(405, 'METHOD_NOT_ALLOWED', 'Phương thức không được hỗ trợ.')
     }
 
-    const allowed = new Set([
-      'country_id',
-      'platform_id',
-      'sort',
-      'limit',
-      'page',
-    ])
-
+    const allowed = new Set(['country_id', 'platform_id', 'sort', 'limit', 'page'])
     rejectUnknownQuery(url.searchParams, allowed)
 
     const countryId = validateSingleInteger(url.searchParams, 'country_id')
@@ -128,14 +107,7 @@ function matchApiRoute(method, url) {
 
     if (
       sortValues.length > 1 ||
-      ![
-        'price_asc',
-        'price_desc',
-        'available_asc',
-        'available_desc',
-        'name_asc',
-        'name_desc',
-      ].includes(sort)
+      !['price_asc', 'price_desc', 'available_asc', 'available_desc', 'name_asc', 'name_desc'].includes(sort)
     ) {
       throw new HttpError(400, 'VALIDATION_ERROR', 'sort không hợp lệ.')
     }
@@ -163,13 +135,8 @@ function matchApiRoute(method, url) {
     if (method !== 'POST') {
       throw new HttpError(405, 'METHOD_NOT_ALLOWED', 'Phương thức không được hỗ trợ.')
     }
-
     rejectUnknownQuery(url.searchParams, new Set())
-
-    return {
-      upstreamPath: '/orders/create',
-      hasBody: true,
-    }
+    return { upstreamPath: '/orders/create', hasBody: true }
   }
 
   if (url.pathname.startsWith('/api/orders/')) {
@@ -178,22 +145,17 @@ function matchApiRoute(method, url) {
     }
 
     const match = url.pathname.match(/^\/api\/orders\/(\d+)$/)
-
     if (!match) {
       throw new HttpError(400, 'VALIDATION_ERROR', 'Mã đơn không hợp lệ.')
     }
 
     const orderId = Number(match[1])
-
     if (!Number.isSafeInteger(orderId) || orderId < 1) {
       throw new HttpError(400, 'VALIDATION_ERROR', 'Mã đơn không hợp lệ.')
     }
 
     rejectUnknownQuery(url.searchParams, new Set())
-
-    return {
-      upstreamPath: `/orders/${orderId}`,
-    }
+    return { upstreamPath: `/orders/${orderId}` }
   }
 
   return null
@@ -233,7 +195,7 @@ function validateCreateBody(body) {
 
   const keys = Object.keys(body)
 
-  if (keys.some(key => !['product_id', 'quantity'].includes(key))) {
+  if (keys.some((key) => !['product_id', 'quantity'].includes(key))) {
     throw new HttpError(400, 'VALIDATION_ERROR', 'Dữ liệu tạo đơn chứa trường không được hỗ trợ.')
   }
 
@@ -252,13 +214,6 @@ function validateCreateBody(body) {
 }
 
 async function proxyToSmscode(request, response, route, config) {
-  // Nếu đã có cache Mỹ thì không gọi API danh sách quốc gia nữa.
-  if (route.filterUsCountries) {
-    if (usCountryCache && Date.now() < usCountryCacheExpiresAt) {
-      return sendJson(response, 200, usCountryCache)
-    }
-  }
-
   const headers = {
     Authorization: `Bearer ${config.token}`,
   }
@@ -279,7 +234,6 @@ async function proxyToSmscode(request, response, route, config) {
 
     headers['Content-Type'] = 'application/json'
     headers['Idempotency-Key'] = idempotencyKey
-
     options.body = JSON.stringify(body)
   }
 
@@ -287,7 +241,6 @@ async function proxyToSmscode(request, response, route, config) {
   options.signal = controller.signal
 
   const timeout = setTimeout(() => controller.abort(), 30000)
-
   let upstream
 
   try {
@@ -315,81 +268,187 @@ async function proxyToSmscode(request, response, route, config) {
     throw new HttpError(502, 'UPSTREAM_ERROR', 'SMSCode trả về JSON không hợp lệ.')
   }
 
-  // Chỉ giữ lại quốc gia Mỹ.
-  if (route.filterUsCountries && upstream.ok) {
-    const extractCountries = value => {
-      if (Array.isArray(value)) return value
-
-      if (!value || typeof value !== 'object') return []
-
-      for (const key of ['data', 'countries', 'items', 'results']) {
-        if (Array.isArray(value[key])) return value[key]
-      }
-
-      if (value.data && typeof value.data === 'object') {
-        return extractCountries(value.data)
-      }
-
-      return []
-    }
-
-    const isUs = country => {
-      const iso = String(
-        country?.iso2 ||
-        country?.iso ||
-        country?.code ||
-        country?.country_code ||
-        ''
-      ).toUpperCase()
-
-      const name = String(
-        country?.name ||
-        country?.country_name ||
-        country?.title ||
-        ''
-      ).toLowerCase()
-
-      return (
-        ['US', 'USA'].includes(iso) ||
-        name.includes('united states') ||
-        name === 'usa'
-      )
-    }
-
-    const countries = extractCountries(payload).filter(isUs)
-
-    if (Array.isArray(payload)) {
-      payload = countries
-    } else if (Array.isArray(payload.data)) {
-      payload.data = countries
-    } else if (Array.isArray(payload.countries)) {
-      payload.countries = countries
-    } else if (Array.isArray(payload.items)) {
-      payload.items = countries
-    } else if (Array.isArray(payload.results)) {
-      payload.results = countries
-    } else if (payload.data && typeof payload.data === 'object') {
-      payload.data = countries
-    }
-
-    if (countries.length) {
-      usCountryCache = payload
-      usCountryCacheExpiresAt = Date.now() + 30 * 24 * 60 * 60 * 1000
-    }
-  }
-
   sendJson(response, upstream.status, payload)
 }
 
+function normalizeAutoSmsOrder(data = {}) {
+  const code = data.code == null ? '' : String(data.code).trim()
+  const rawStatus = String(data.status || '').toLowerCase()
+
+  let status = 'ACTIVE'
+
+  if (code) status = 'OTP_RECEIVED'
+  else if (['cancelled', 'canceled'].includes(rawStatus)) status = 'CANCELED'
+  else if (['expired', 'timeout'].includes(rawStatus)) status = 'EXPIRED'
+  else if (['completed', 'done'].includes(rawStatus)) status = 'COMPLETED'
+
+  return {
+    id: String(data.id || data.order_id || ''),
+    phone_number: String(data.phone || data.phone_number || ''),
+    otp_code: code || null,
+    status,
+    price: data.price ?? null,
+    message: data.message || '',
+    expired_at: data.expired_at || null,
+    remaining_seconds: data.remaining_seconds ?? null,
+  }
+}
+
+async function callAutoSms(pathname, config) {
+  const url = new URL(pathname, AUTOSMS_BASE_URL)
+  url.searchParams.set('key', config.autosmsApiKey)
+
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 25000)
+  let upstream
+
+  try {
+    upstream = await config.fetchImpl(url, {
+      method: 'GET',
+      headers: { accept: 'application/json' },
+      signal: controller.signal,
+    })
+  } catch {
+    throw new HttpError(502, 'AUTOSMS_CONNECTION_ERROR', 'Không thể kết nối đến AutoSMS.')
+  } finally {
+    clearTimeout(timeout)
+  }
+
+  let payload
+
+  try {
+    payload = await upstream.json()
+  } catch {
+    throw new HttpError(502, 'AUTOSMS_INVALID_RESPONSE', 'AutoSMS trả về JSON không hợp lệ.')
+  }
+
+  if (!upstream.ok || payload.success !== true) {
+    throw new HttpError(
+      502,
+      'AUTOSMS_ERROR',
+      payload.message || `AutoSMS báo lỗi HTTP ${upstream.status}.`
+    )
+  }
+
+  return payload.data
+}
+
+async function handleAutoSms(request, response, url, config) {
+  const pathname = url.pathname
+
+  if (pathname === '/api/autosms/balance' && request.method === 'GET') {
+    rejectUnknownQuery(url.searchParams, new Set())
+    const data = await callAutoSms('/api/balance', config)
+    return sendJson(response, 200, { success: true, data })
+  }
+
+  if (pathname === '/api/autosms/catalog') {
+    if (request.method !== 'GET') {
+      throw new HttpError(405, 'METHOD_NOT_ALLOWED', 'Phương thức không được hỗ trợ.')
+    }
+
+    return sendJson(response, 200, {
+      success: true,
+      data: [{
+        id: 1,
+        name: 'TikTok Mỹ · AutoSMS',
+        country: 'US',
+        service: 'TikTok',
+        price: null,
+        available: null,
+      }],
+    })
+  }
+
+  if (pathname === '/api/autosms/orders/create' && request.method === 'POST') {
+    rejectUnknownQuery(url.searchParams, new Set())
+    const body = await readJsonBody(request)
+
+    if (
+      !body ||
+      typeof body !== 'object' ||
+      Array.isArray(body) ||
+      !Number.isSafeInteger(body.quantity) ||
+      body.quantity < 1 ||
+      body.quantity > 20
+    ) {
+      throw new HttpError(400, 'VALIDATION_ERROR', 'quantity phải là số nguyên từ 1 đến 20.')
+    }
+
+    const orders = []
+    let failedCount = 0
+
+    for (let i = 0; i < body.quantity; i++) {
+      try {
+        const data = await callAutoSms('/api/buy-number/us/tiktok', config)
+
+        if (!data || !(data.order_id || data.id) || !data.phone) {
+          throw new Error('Thiếu order_id hoặc phone trong phản hồi AutoSMS.')
+        }
+
+        orders.push({
+          id: String(data.order_id || data.id),
+          phone_number: String(data.phone),
+          otp_code: null,
+          status: 'ACTIVE',
+          price: data.price ?? null,
+          expired_at: data.expired_at || null,
+          country_calling_code: '1',
+        })
+      } catch (error) {
+        failedCount++
+        if (body.quantity === 1) throw error
+      }
+    }
+
+    return sendJson(response, 200, {
+      success: true,
+      data: { orders, failed_count: failedCount },
+    })
+  }
+
+  const orderMatch = pathname.match(
+    /^\/api\/autosms\/orders\/([A-Za-z0-9_-]{1,100})$/
+  )
+
+  if (orderMatch && request.method === 'GET') {
+    rejectUnknownQuery(url.searchParams, new Set())
+    const data = await callAutoSms(
+      `/api/orders/${encodeURIComponent(orderMatch[1])}`,
+      config
+    )
+    return sendJson(response, 200, {
+      success: true,
+      data: normalizeAutoSmsOrder(data || {}),
+    })
+  }
+
+  const cancelMatch = pathname.match(
+    /^\/api\/autosms\/cancel\/([A-Za-z0-9_-]{1,100})$/
+  )
+
+  if (cancelMatch && request.method === 'POST') {
+    rejectUnknownQuery(url.searchParams, new Set())
+    const data = await callAutoSms(
+      `/api/cancel/${encodeURIComponent(cancelMatch[1])}`,
+      config
+    )
+    return sendJson(response, 200, { success: true, data: data || {} })
+  }
+
+  return null
+}
 function createApp({
   upstreamBaseUrl = DEFAULT_UPSTREAM,
   token = SMSCODE_TOKEN,
+  autosmsApiKey = AUTOSMS_API_KEY,
   fetchImpl = fetch,
   rootDir = __dirname,
 } = {}) {
   const config = {
     upstreamBaseUrl,
     token,
+    autosmsApiKey,
     fetchImpl,
     rootDir,
   }
@@ -397,6 +456,18 @@ function createApp({
   return async function app(request, response) {
     try {
       const url = new URL(request.url, 'http://127.0.0.1')
+
+      if (url.pathname.startsWith('/api/autosms/')) {
+        const handled = await handleAutoSms(request, response, url, config)
+
+        if (handled !== null) return handled
+
+        return sendJson(
+          response,
+          404,
+          errorPayload('NOT_FOUND', 'AutoSMS API route không tồn tại.')
+        )
+      }
 
       if (url.pathname.startsWith('/api/')) {
         const route = matchApiRoute(request.method, url)
@@ -439,11 +510,9 @@ function createApp({
       })
 
       response.end(request.method === 'HEAD' ? undefined : contents)
-
     } catch (error) {
       const status = error instanceof HttpError ? error.status : 500
       const code = error instanceof HttpError ? error.code : 'INTERNAL_ERROR'
-
       const message = error instanceof HttpError
         ? error.message
         : 'Lỗi máy chủ nội bộ.'
@@ -463,8 +532,11 @@ function openUrl(url) {
   const { exec } = require('node:child_process')
   const { platform } = require('node:os')
 
+  let command
+
   if (platform() === 'win32') {
-    exec(`cmd.exe /c start "" "${url}"`)
+    command = `start "" "${url}"`
+    exec(`cmd.exe /c ${command}`)
   } else if (platform() === 'darwin') {
     exec('open "$URL"', {
       env: { ...process.env, URL: url },
@@ -496,7 +568,6 @@ function startServer({
 } = {}) {
   return new Promise((resolve, reject) => {
     const app = express()
-
     app.use(createApp())
 
     const server = http.createServer(app)
@@ -506,7 +577,7 @@ function startServer({
     const roomSettings = new Map()
     const roomRevisions = new Map()
 
-    const publishDevices = roomId => {
+    const publishDevices = (roomId) => {
       const devices = [
         ...(roomDevices.get(roomId)?.entries() || []),
       ].map(([socketId, deviceId]) => ({
@@ -516,7 +587,6 @@ function startServer({
       }))
 
       io.to(roomId).emit('room-devices', devices)
-
       console.log(`Tổng thiết bị đang kết nối: ${devices.length}`)
     }
 
@@ -525,19 +595,21 @@ function startServer({
         return null
       }
 
-      const integerOrNull = value => {
-        const number = Number(value)
+      const provider = ['smscode', 'autosms'].includes(input.provider)
+        ? input.provider
+        : null
 
-        return Number.isSafeInteger(number) && number > 0
-          ? number
-          : null
+      if (!provider) return null
+
+      const integerOrNull = (value) => {
+        const number = Number(value)
+        return Number.isSafeInteger(number) && number > 0 ? number : null
       }
 
       const countryId = integerOrNull(input.countryId)
       const productId = integerOrNull(input.productId)
 
       const intervalValue = Number(input.interval)
-
       const interval = Number.isFinite(intervalValue)
         ? Math.max(1, Math.min(60, Math.round(intervalValue)))
         : 5
@@ -551,7 +623,7 @@ function startServer({
         .slice(0, 80)
 
       return {
-        provider: 'smscode',
+        provider,
         countryId,
         countryName,
         callingCode,
@@ -560,7 +632,7 @@ function startServer({
       }
     }
 
-    io.on('connection', socket => {
+    io.on('connection', (socket) => {
 
       // Thiết bị tham gia phòng
       socket.on('join-room', ({ roomId, deviceId } = {}) => {
@@ -574,9 +646,7 @@ function startServer({
 
         if (socket.data.roomId) {
           socket.leave(socket.data.roomId)
-
           roomDevices.get(socket.data.roomId)?.delete(socket.id)
-
           publishDevices(socket.data.roomId)
         }
 
@@ -591,6 +661,7 @@ function startServer({
 
         roomDevices.get(roomId).set(socket.id, deviceId)
 
+        // Gửi cấu hình mới nhất cho thiết bị vừa kết nối
         const savedSettings = roomSettings.get(roomId) || null
 
         socket.emit('room-settings', {
@@ -603,7 +674,7 @@ function startServer({
       })
 
       // Đồng bộ cấu hình hai chiều
-      socket.on('room-settings', payload => {
+      socket.on('room-settings', (payload = {}) => {
         if (
           socket.data.roomId !== payload.roomId ||
           socket.data.deviceId !== payload.senderDeviceId
@@ -612,7 +683,6 @@ function startServer({
         }
 
         const settings = sanitizeSettings(payload.settings)
-
         if (!settings) return
 
         const revision = (roomRevisions.get(payload.roomId) || 0) + 1
@@ -627,8 +697,8 @@ function startServer({
         })
       })
 
-      // Điều khiển thiết bị trong phòng
-      socket.on('room-command', command => {
+      // Điều khiển các thiết bị trong phòng
+      socket.on('room-command', (command = {}) => {
         if (
           socket.data.roomId !== command.roomId ||
           socket.data.deviceId !== command.senderDeviceId
@@ -661,7 +731,6 @@ function startServer({
         if (!roomId) return
 
         roomDevices.get(roomId)?.delete(socket.id)
-
         publishDevices(roomId)
       })
     })
@@ -694,7 +763,7 @@ function startServer({
 }
 
 if (require.main === module) {
-  startServer().catch(error => {
+  startServer().catch((error) => {
     console.error(`Không thể khởi động server: ${error.message}`)
     process.exitCode = 1
   })
