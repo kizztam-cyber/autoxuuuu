@@ -826,7 +826,7 @@
             <label for="providerSelect">Nhà cung cấp</label>
             <select id="providerSelect">
               <option value="smscode">SMSCode</option>
-              <option value="autosms">Grizzysms</option>
+              <option value="grizzly">GrizzlySMS</option>
             </select>
           </div>
           <div class="field" id="countryField" style="width:100%;flex-basis:100%">
@@ -943,6 +943,7 @@
       let selectedCallingCode = '1'
       let availableCountries = []
       let selectedCountry = null
+      let selectedGrizzlyMaxPrice = 0.015
       const orderProviders = new Map()
       let applyingRemoteSettings = false
       let currentSharedRevision = 0
@@ -1086,20 +1087,34 @@
         }
 
         try {
-          if (activeProvider === 'autosms') {
+          if (activeProvider === 'grizzly') {
             selectedCallingCode = '1'
             elements.countryField.style.display = 'none'
-            const option = document.createElement('div')
-            option.className = 'product-option selected'
-            const name = document.createElement('div')
-            name.className = 'product-name'
-            name.textContent = 'TikTok Mỹ · Gryzziii'
-            const info = document.createElement('div')
-            info.className = 'product-info'
-            info.textContent = 'Hoa Kỳ (+1) · Giá và số lượng do Gryziii trả về khi thuê'
-            option.append(name, info)
-            productOptions.appendChild(option)
-            PRODUCT_ID = 1
+            const catalogResponse = await fetch('/api/grizzly/catalog')
+            const catalogPayload = await catalogResponse.json()
+            if (!catalogResponse.ok || !catalogPayload.success) throw new Error(catalogPayload.error?.message || 'Không tải được danh mục GrizzlySMS.')
+            for (const priceCap of [0.015, 0.025]) {
+              const option = document.createElement('div')
+              option.className = 'product-option' + (priceCap === 0.015 ? ' selected' : '')
+              option.dataset.maxPrice = String(priceCap)
+              const name = document.createElement('div')
+              name.className = 'product-name'
+              name.textContent = `TikTok USA virtual · tối đa $${priceCap.toFixed(3)}`
+              const info = document.createElement('div')
+              info.className = 'product-info'
+              info.textContent = 'GrizzlySMS · chỉ mua nếu giá thực tế không vượt mức đã chọn'
+              option.append(name, info)
+              option.addEventListener('click', () => {
+                productOptions.querySelectorAll('.product-option').forEach(item => item.classList.remove('selected'))
+                option.classList.add('selected')
+                PRODUCT_ID = priceCap === 0.015 ? 15 : 25
+                selectedGrizzlyMaxPrice = priceCap
+                broadcastSharedSettings()
+              })
+              productOptions.appendChild(option)
+            }
+            PRODUCT_ID = 15
+            selectedGrizzlyMaxPrice = 0.015
             await loadProviderBalance()
             return
           }
@@ -1227,9 +1242,9 @@
       }
 
       async function loadProviderBalance() {
-        if (activeProvider === 'autosms') {
+        if (activeProvider === 'grizzly') {
           try {
-            const result = await fetch('/api/autosms/balance').then(r => r.json())
+            const result = await fetch('/api/grizzly/balance').then(r => r.json())
             if (!result.success) throw new Error(result.error?.message || 'Không lấy được số dư')
             const value = result.data?.balance ?? result.data?.amount ?? result.data
             elements.providerBalance.textContent = typeof value === 'object' ? JSON.stringify(value) : String(value ?? '—')
@@ -1319,6 +1334,7 @@
           countryName: selectedCountry ? countryNameOf(selectedCountry) : null,
           callingCode: selectedCallingCode || '',
           productId: Number.isFinite(PRODUCT_ID) ? PRODUCT_ID : null,
+          maxPrice: selectedGrizzlyMaxPrice,
           interval: Math.max(1, Math.min(60, Number(elements.interval.value) || 5)),
         }
       }
@@ -1338,7 +1354,7 @@
         applyingRemoteSettings = true
 
         try {
-          const nextProvider = settings.provider === 'autosms' ? 'autosms' : 'smscode'
+          const nextProvider = settings.provider === 'grizzly' ? 'grizzly' : 'smscode'
           const providerChanged = activeProvider !== nextProvider
           const nextCountryId = Number(settings.countryId || 0)
           const countryChanged = nextProvider === 'smscode' &&
@@ -1378,8 +1394,15 @@
             if (targetProduct) chooseProduct(targetProduct, false)
           }
 
-          if (activeProvider === 'autosms') {
+          if (activeProvider === 'grizzly') {
             selectedCallingCode = '1'
+            if ([0.015, 0.025].includes(Number(settings.maxPrice))) {
+              selectedGrizzlyMaxPrice = Number(settings.maxPrice)
+              PRODUCT_ID = selectedGrizzlyMaxPrice === 0.015 ? 15 : 25
+              productOptions.querySelectorAll('.product-option').forEach(option => {
+                option.classList.toggle('selected', Number(option.dataset.maxPrice) === selectedGrizzlyMaxPrice)
+              })
+            }
           }
 
           if (revision) currentSharedRevision = revision
@@ -1466,18 +1489,18 @@
           return
         }
         const quantity = 1
-        const callingCode = provider === 'autosms' ? '1' : selectedCallingCode
+        const callingCode = provider === 'grizzly' ? '1' : selectedCallingCode
         setBusy(elements.localBuyButton, true, 'Đang tạo...')
         try {
           let result
-          if (provider === 'autosms') {
-            const response = await fetch('/api/autosms/orders/create', {
+          if (provider === 'grizzly') {
+            const response = await fetch('/api/grizzly/orders/create', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ quantity })
+              body: JSON.stringify({ maxPrice: selectedGrizzlyMaxPrice })
             })
             const payload = await response.json()
-            if (!response.ok || !payload.success) throw new Error(payload.error?.message || 'Không thuê được số AutoSMS.')
+            if (!response.ok || !payload.success) throw new Error(payload.error?.message || 'Không thuê được số GrizzlySMS.')
             result = payload.data
           } else {
             result = await client.createOrder({
@@ -1524,10 +1547,10 @@
 
             const providerInfo = orderProviders.get(String(orderId)) || { provider: 'smscode' }
             let order
-            if (providerInfo.provider === 'autosms') {
-              const response = await fetch(`/api/autosms/orders/${encodeURIComponent(orderId)}`)
+            if (providerInfo.provider === 'grizzly') {
+              const response = await fetch(`/api/grizzly/orders/${encodeURIComponent(orderId)}`)
               const payload = await response.json()
-              if (!response.ok || !payload.success) throw new Error(payload.error?.message || 'Lỗi kiểm tra OTP AutoSMS')
+              if (!response.ok || !payload.success) throw new Error(payload.error?.message || 'Lỗi kiểm tra OTP GrizzlySMS')
               order = payload.data
             } else {
               order = await client.getOrder(orderId)
@@ -1567,7 +1590,7 @@
 
         row.id = `row-${order.id}`
         const provider = order._provider || activeProvider
-        const callingCode = order._callingCode || (provider === 'autosms' ? '1' : selectedCallingCode)
+        const callingCode = order._callingCode || (provider === 'grizzly' ? '1' : selectedCallingCode)
         orderProviders.set(String(order.id), { provider, callingCode })
 
         row.append(
@@ -1861,4 +1884,3 @@
   </body>
 
 </html>
-
