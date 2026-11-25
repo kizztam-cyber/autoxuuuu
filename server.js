@@ -6,7 +6,7 @@ const express = require('express')
 const { Server } = require('socket.io')
 const os = require('node:os')
 
-const SMSCODE_TOKEN = 'f3627025b2ea12b051ba385bf2e135687bc4ce90459e2ef386b78ebb5bbe9cbd'
+const SMSCODE_TOKEN = '3b9be4089ad5d8a4e13386d3ad28811bc623fcaa72c113516f267456515a8b75'
 const GRIZZLY_API_KEY = 'dd00afe86fb143948187acdbff3085ba'
 const GRIZZLY_BASE_URL = 'https://api.grizzlysms.com/stubs/handler_api.php'
 const DEFAULT_UPSTREAM = 'https://api.smscode.gg/v2'
